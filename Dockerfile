@@ -1,4 +1,4 @@
-# Hugging Face Spaces (Docker SDK): single container, port 7860, runs as UID 1000.
+# Single container (Render, Cloud Run, HF Spaces): honours $PORT, defaults to 7860; runs as UID 1000.
 FROM node:20-alpine AS web
 WORKDIR /web
 COPY frontend/package.json ./
@@ -19,4 +19,4 @@ ENV DISABLE_OLLAMA=true \
     DATABASE_URL=sqlite:////tmp/examprep.db
 USER user
 EXPOSE 7860
-CMD ["uvicorn", "space_app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["sh", "-c", "uvicorn space_app:app --host 0.0.0.0 --port ${PORT:-7860}"]

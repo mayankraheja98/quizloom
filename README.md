@@ -94,7 +94,7 @@ Optional local LLM: install [Ollama](https://ollama.com) and `ollama pull gemma3
 
 ## Deploy
 
-**Hugging Face Spaces (single container):** create a Docker Space, push this folder. In Settings → Secrets set `JWT_SECRET` and `DATABASE_URL` (free Postgres, e.g. Neon). Without `DATABASE_URL`, SQLite lives in `/tmp` and resets on restart.
+**Render (single container, free, no card):** push to GitHub, create a Render *Web Service* from the repo (runtime Docker, root `Dockerfile`, free instance). Set `JWT_SECRET` and `DATABASE_URL` (free Postgres, e.g. Neon) as environment variables. The free instance sleeps after ~15 min idle. The same image works on Google Cloud Run and on Hugging Face Docker Spaces (paid).
 
 **Railway (backend) + Netlify (frontend):** deploy `backend/` on Railway with a volume at `/data` and `DATABASE_URL=sqlite:////data/examprep.db`; deploy the frontend on Netlify with `BACKEND_URL` pointing at Railway (see `netlify.toml`, `railway.toml`).
 
