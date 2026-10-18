@@ -1,0 +1,48 @@
+services:
+
+  # ── Ollama ──────────────────────────────────────────────────────────────────
+  # Ollama runs on the HOST machine (not in Docker) to avoid corporate TLS issues
+  # and GPU passthrough complexity. Make sure `ollama serve` is running on your
+  # host before starting this stack.
+  #
+  # To use a containerised Ollama instead, uncomment the ollama + ollama-pull
+  # services below and change OLLAMA_BASE_URL in the backend service to
+  # http://ollama:11434. You'll also need to add the corporate CA cert to the
+  # container image so it can reach registry.ollama.ai.
+
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: examprep-backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux support (already works on Mac/Windows)
+    environment:
+      # Points at the Ollama process running on your host machine
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - SSL_VERIFY=${SSL_VERIFY:-true}
+      - JWT_SECRET=${JWT_SECRET:-dev-insecure-change-me}
+    volumes:
+      - db_data:/app/data           # SQLite DB persistence
+    # Override DB path to the mounted volume
+    command: >
+      sh -c "mkdir -p /app/data &&
+             ln -sf /app/data/examprep.db /app/examprep.db &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
+
+  # ── Frontend (nginx) ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: examprep-frontend
+    depends_on:
+      - backend
+    ports:
+      - "${APP_PORT:-3000}:80"      # http://localhost:3000
+    restart: unless-stopped
+
+volumes:
+  db_data:        # SQLite database
