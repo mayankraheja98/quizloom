@@ -36,8 +36,9 @@ _TEXT_BLOCK_TYPES = {
     "code",
 }
 
-MIN_CHARS = 100   # discard very short fragments
-MAX_CHARS = 2500  # cap chunk size sent to LLM
+MIN_CHARS = 60      # drop only pure noise
+TARGET_CHARS = 1500  # flush a chunk once it reaches this size
+MAX_CHARS = 2500    # cap chunk size sent to LLM
 
 MAX_PAGES = int(os.getenv("NOTION_MAX_PAGES", "50"))  # root page + sub-pages followed
 MAX_IMAGES = 15                       # per page, to respect free-tier rate limits
@@ -218,7 +219,7 @@ async def _download_image(url: str) -> tuple[bytes, str]:
 
 async def blocks_to_paragraphs(blocks: list[dict], describe=None) -> tuple[list[str], dict]:
     """
-    Group consecutive text lines into chunks of MIN_CHARS–MAX_CHARS. Headings flush the buffer.
+    Group consecutive text lines into chunks of about TARGET_CHARS. Headings flush the buffer.
     `describe(image_bytes, mime) -> str` (async) transcribes images; if None images contribute
     their caption only. Returns (paragraphs, stats).
     """
@@ -266,7 +267,7 @@ async def blocks_to_paragraphs(blocks: list[dict], describe=None) -> tuple[list[
             buf.append(text)
         else:
             buf.append(text)
-            if len(" ".join(buf)) >= MIN_CHARS:
+            if len(" ".join(buf)) >= TARGET_CHARS:
                 flush()
 
     flush()

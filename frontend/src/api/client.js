@@ -34,6 +34,7 @@ export const uploadFile = (formData) => req("POST", "/upload", formData, true);
 export const getLabelStatus = (name) => req("GET", `/upload/status/${encodeURIComponent(name)}`);
 export const generateFromTopic = (body) => req("POST", "/upload/generate-from-topic", body);
 export const fromNotion = (body) => req("POST", "/upload/from-notion", body);
+export const getLimits = () => req("GET", "/upload/limits");
 export const getProviders = () => req("GET", "/upload/providers");
 
 // ── Question bank ─────────────────────────────────────────────────────────────

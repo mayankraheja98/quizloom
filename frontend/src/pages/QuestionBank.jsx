@@ -9,6 +9,7 @@ import {
   generateFromTopic,
   fromNotion,
   getProviders,
+  getLimits,
 } from "../api/client";
 
 const PROVIDER_META = {
@@ -26,6 +27,21 @@ const writePrefs = (fn) => {
   try { localStorage.setItem(prefsKey(), JSON.stringify(fn(readPrefs()))); } catch { /* storage unavailable */ }
 };
 const clearPrefs = () => { try { localStorage.removeItem(prefsKey()); } catch { /* ignore */ } };
+
+// Optional "what is this about" text, remembered per user and per tab
+const focusKey = (tab) => `examprep:focus:${localStorage.getItem("username") || "anon"}:${tab}`;
+function usePersistedText(tab) {
+  const [value, setValue] = useState(() => {
+    try { return localStorage.getItem(focusKey(tab)) || ""; } catch { return ""; }
+  });
+  useEffect(() => {
+    try {
+      if (value) localStorage.setItem(focusKey(tab), value);
+      else localStorage.removeItem(focusKey(tab));
+    } catch { /* storage unavailable */ }
+  }, [tab, value]);
+  return [value, setValue];
+}
 
 function useLLMPrefs(defaultModel = "gemma3:4b") {
   const [init] = useState(readPrefs);
@@ -51,6 +67,48 @@ function useLLMPrefs(defaultModel = "gemma3:4b") {
     setApiKey(saved.apiKey || "");
   };
   return { provider, setProvider, model, setModel, apiKey, setApiKey };
+}
+
+function DensitySelect({ value, onChange }) {
+  return (
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">Question density</label>
+      <select value={value} onChange={(e) => onChange(e.target.value)}
+        className="border rounded px-3 py-1.5 text-sm">
+        <option value="1">Light (~2-3 per page)</option>
+        <option value="2">Normal (~5 per page)</option>
+        <option value="4">Dense (~10 per page)</option>
+      </select>
+    </div>
+  );
+}
+
+function StyleSelect({ value, onChange }) {
+  return (
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">Question style</label>
+      <select value={value} onChange={(e) => onChange(e.target.value)}
+        className="border rounded px-3 py-1.5 text-sm">
+        <option value="mixed">Mixed (concepts + scenarios)</option>
+        <option value="conceptual">Conceptual (definitions, rules)</option>
+        <option value="scenario">Scenario-based</option>
+      </select>
+    </div>
+  );
+}
+
+function FocusField({ value, onChange }) {
+  return (
+    <div>
+      <label className="block text-xs text-gray-500 mb-1">
+        What is this about / what should be tested? <span className="text-gray-400">(optional)</span>
+      </label>
+      <textarea value={value} onChange={(e) => onChange(e.target.value.slice(0, 500))} rows={2}
+        placeholder="e.g. cybersecurity, privacy  —  or a sentence such as: lecture on GDPR principles; focus on definitions and rules, not the case studies"
+        className="w-full border rounded px-3 py-2 text-sm resize-none" />
+      <p className="text-[11px] text-gray-400 text-right">{value.length}/500</p>
+    </div>
+  );
 }
 
 function ProviderFields({ provider, setProvider, model, setModel, apiKey, setApiKey, providers }) {
@@ -126,6 +184,9 @@ function JobProgress({ count, job, active }) {
   } else if (job.total_chunks === 0) {
     tone = "text-red-600";
     text = `✗ Failed: ${job.last_error || "no readable text found in the source."}`;
+  } else if (job.failed_chunks === 0 && job.generated === 0) {
+    tone = "text-amber-600";
+    text = "⚠ No questions generated: the content had no testable concepts (only examples, anecdotes or admin text).";
   } else if (job.failed_chunks === job.total_chunks) {
     tone = "text-red-600";
     text = `✗ Failed: no questions generated (${job.failed_chunks}/${job.total_chunks} chunks failed).`;
@@ -134,7 +195,8 @@ function JobProgress({ count, job, active }) {
     text = `⚠ Finished with errors: ${count} questions in the label; ${job.failed_chunks}/${job.total_chunks} chunks failed.`;
   } else {
     tone = "text-green-700";
-    text = `✓ Done: questions generated from ${job.total_chunks} chunk(s). Label now has ${count} questions.`;
+    text = `✓ Done: ${job.generated} new questions from ${job.total_chunks} chunk(s)` +
+      `${job.skipped_chunks > 0 ? `, ${job.skipped_chunks} skipped (nothing testable)` : ""}. Label now has ${count} questions.`;
   }
   return (
     <div className={`mt-2 text-sm font-medium ${tone}`}>
@@ -183,6 +245,13 @@ export default function QuestionBank() {
   const [pollJob, setPollJob] = useState(null);
   const { provider: upProvider, setProvider: setUpProvider, model: upModel, setModel: setUpModel, apiKey: upApiKey, setApiKey: setUpApiKey } = useLLMPrefs();
   const [upMax, setUpMax] = useState("");
+  const [upDensity, setUpDensity] = useState("2");
+  const [upStyle, setUpStyle] = useState("mixed");
+  const [upFocus, setUpFocus] = usePersistedText("upload");
+  const [upIsPdf, setUpIsPdf] = useState(false);
+  const [pageFrom, setPageFrom] = useState("");
+  const [pageTo, setPageTo] = useState("");
+  const [maxMb, setMaxMb] = useState(25);
   const fileRef = useRef();
   const labelRef = useRef();
 
@@ -198,6 +267,9 @@ export default function QuestionBank() {
   }, [notionToken]);
   const { provider: notionProvider, setProvider: setNotionProvider, model: notionModel, setModel: setNotionModel, apiKey: notionApiKey, setApiKey: setNotionApiKey } = useLLMPrefs();
   const [notionMax, setNotionMax] = useState("");
+  const [notionDensity, setNotionDensity] = useState("2");
+  const [notionStyle, setNotionStyle] = useState("mixed");
+  const [notionFocus, setNotionFocus] = usePersistedText("notion");
   const [notionReadImages, setNotionReadImages] = useState(false);
   const [notionLoading, setNotionLoading] = useState(false);
   const [notionMsg, setNotionMsg] = useState("");
@@ -219,6 +291,7 @@ export default function QuestionBank() {
   useEffect(() => {
     loadLabels();
     getProviders().then(setProviders).catch(() => {});
+    getLimits().then((l) => setMaxMb(l.max_upload_mb)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -267,6 +340,9 @@ export default function QuestionBank() {
         model: notionModel.trim(),
         api_key: notionApiKey.trim(),
         max_questions: notionMax ? Number(notionMax) : null,
+        density: Number(notionDensity),
+        style: notionStyle,
+        focus: notionFocus.trim(),
         read_images: notionProvider === "gemini" && notionReadImages,
       });
       setNotionMsg(`✓ "${r.page_title}" accepted. Fetching pages${r.read_images ? ", reading images" : ""} and generating in the background…`);
@@ -307,6 +383,17 @@ export default function QuestionBank() {
     const file = fileRef.current.files[0];
     const label = labelRef.current.value.trim();
     if (!file || !label) return;
+    if (file.size > maxMb * 1024 * 1024) {
+      setUploadMsg(
+        `Error: file is ${(file.size / 1048576).toFixed(1)} MB (max ${maxMb} MB). Compress or split it, ` +
+        "or for a PDF book upload one chapter at a time using the page range after reducing the file."
+      );
+      return;
+    }
+    if (upIsPdf && pageFrom && pageTo && Number(pageTo) < Number(pageFrom)) {
+      setUploadMsg("Error: 'To page' must be greater than or equal to 'From page'.");
+      return;
+    }
 
     const fd = new FormData();
     fd.append("file", file);
@@ -315,6 +402,11 @@ export default function QuestionBank() {
     fd.append("model", upModel.trim());
     fd.append("api_key", upApiKey.trim());
     if (upMax) fd.append("max_questions", upMax);
+    fd.append("density", upDensity);
+    fd.append("style", upStyle);
+    if (upFocus.trim()) fd.append("focus", upFocus.trim());
+    if (upIsPdf && pageFrom) fd.append("page_from", pageFrom);
+    if (upIsPdf && pageTo) fd.append("page_to", pageTo);
 
     setUploading(true);
     setUploadMsg("");
@@ -380,11 +472,12 @@ export default function QuestionBank() {
                   <div>
                     <label className="block text-xs text-gray-500 mb-1">File (PDF, DOCX, or TXT)</label>
                     <input ref={fileRef} type="file" accept=".pdf,.docx,.txt" required
+                      onChange={(e) => setUpIsPdf(e.target.files[0]?.name.toLowerCase().endsWith(".pdf") || false)}
                       className="text-sm border rounded px-2 py-1" />
                   </div>
                   <div>
-                    <label className="block text-xs text-gray-500 mb-1">Label</label>
-                    <input ref={labelRef} type="text" placeholder="e.g. CISSP Domain 1" required
+                    <label className="block text-xs text-gray-500 mb-1">Label(s), comma-separated</label>
+                    <input ref={labelRef} type="text" placeholder="e.g. CISSP Domain 1, CISSP" required
                       className="border rounded px-3 py-1.5 text-sm w-48" />
                   </div>
                   <div>
@@ -393,7 +486,27 @@ export default function QuestionBank() {
                       placeholder="auto"
                       className="w-32 border rounded px-3 py-1.5 text-sm" />
                   </div>
+                  <DensitySelect value={upDensity} onChange={setUpDensity} />
+                  <StyleSelect value={upStyle} onChange={setUpStyle} />
+                  {upIsPdf && (
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">PDF pages (optional)</label>
+                      <div className="flex items-center gap-1">
+                        <input type="number" min={1} value={pageFrom} onChange={(e) => setPageFrom(e.target.value)}
+                          placeholder="from" className="w-20 border rounded px-2 py-1.5 text-sm" />
+                        <span className="text-gray-400 text-sm">–</span>
+                        <input type="number" min={1} value={pageTo} onChange={(e) => setPageTo(e.target.value)}
+                          placeholder="to" className="w-20 border rounded px-2 py-1.5 text-sm" />
+                      </div>
+                    </div>
+                  )}
                 </div>
+                <FocusField value={upFocus} onChange={setUpFocus} />
+                <p className="text-xs text-gray-500">
+                  Max file size {maxMb} MB. Importing a big book? Pick a PDF page range (one chapter or domain
+                  at a time), or compress/split the file first; only text is used, so images just add size.
+                  Scanned PDFs without a text layer can't be read.
+                </p>
                 <ProviderFields
                   provider={upProvider} setProvider={setUpProvider}
                   model={upModel} setModel={setUpModel}
@@ -422,9 +535,9 @@ export default function QuestionBank() {
               <form onSubmit={handleTopicGenerate} className="space-y-3">
                 <div className="flex flex-wrap gap-3 items-end">
                   <div className="flex-1 min-w-48">
-                    <label className="block text-xs text-gray-500 mb-1">Label</label>
+                    <label className="block text-xs text-gray-500 mb-1">Label(s), comma-separated</label>
                     <input type="text" value={topicLabel} onChange={(e) => setTopicLabel(e.target.value)}
-                      placeholder="e.g. CISSP Domain 3" required
+                      placeholder="e.g. CISSP Domain 3, Crypto" required
                       className="w-full border rounded px-3 py-1.5 text-sm" />
                   </div>
                   <div>
@@ -488,9 +601,9 @@ export default function QuestionBank() {
               <form onSubmit={handleNotionIngest} className="space-y-3">
                 <div className="flex flex-wrap gap-3 items-end">
                   <div className="flex-1 min-w-48">
-                    <label className="block text-xs text-gray-500 mb-1">Label</label>
+                    <label className="block text-xs text-gray-500 mb-1">Label(s), comma-separated</label>
                     <input type="text" value={notionLabel} onChange={(e) => setNotionLabel(e.target.value)}
-                      placeholder="e.g. CIPP/E Notes" required
+                      placeholder="e.g. CIPP/E Notes, GDPR" required
                       className="w-full border rounded px-3 py-1.5 text-sm" />
                   </div>
                   <div>
@@ -499,6 +612,8 @@ export default function QuestionBank() {
                       placeholder="auto"
                       className="w-32 border rounded px-3 py-1.5 text-sm" />
                   </div>
+                  <DensitySelect value={notionDensity} onChange={setNotionDensity} />
+                  <StyleSelect value={notionStyle} onChange={setNotionStyle} />
                 </div>
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Notion Page URL</label>
@@ -516,6 +631,7 @@ export default function QuestionBank() {
                     placeholder="secret_..." required
                     className="w-full border rounded px-3 py-1.5 text-sm" />
                 </div>
+                <FocusField value={notionFocus} onChange={setNotionFocus} />
                 <ProviderFields
                   provider={notionProvider} setProvider={setNotionProvider}
                   model={notionModel} setModel={setNotionModel}

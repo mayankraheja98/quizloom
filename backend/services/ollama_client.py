@@ -54,17 +54,41 @@ _SYSTEM_PROMPT = (
     "conceptual understanding, not mere memorisation."
 )
 
+_STYLES = {
+    "conceptual": "Write DIRECT conceptual questions: definitions, principles, rules, requirements, "
+                  "processes and distinctions between related concepts.",
+    "scenario": "Write SCENARIO-BASED questions: a short, realistic situation (2-4 sentences) followed by a "
+                "question asking which principle, rule or action applies. Invent fresh scenarios; do not "
+                "copy the text's own example.",
+    "mixed": "Mix the two styles: roughly half direct conceptual questions (definitions, rules, "
+             "distinctions) and half short scenario-based questions that apply a concept to a NEW situation.",
+}
+
 _USER_TEMPLATE = """\
-Generate exactly {n} multiple-choice question(s) based on the text below.
+Write {n} multiple-choice question(s) that test UNDERSTANDING of the concepts in the study material below.
+{style}
+{focus_block}
+WHAT TO TEST:
+- The underlying concept, principle, rule, definition, process or distinction the material teaches.
+- Illustrations, case studies, anecdotes, named people/companies and sample figures in the material exist \
+only to explain a concept. Do NOT ask what happened in an example, and do NOT ask for incidental details \
+(names, places, amounts, dates, statistics) unless that detail is itself a rule or requirement the learner \
+must know (for example a legal deadline or threshold).
+- If the material gives an example, you may reuse its idea as a scenario that asks the learner to APPLY the \
+concept to a similar but different situation.
 
-TEXT:
+QUALITY RULES:
+1. Each question must make sense on its own: never write "according to the text/passage/example".
+2. Exactly 4 options labelled A, B, C, D, exactly one correct. Wrong options must be plausible \
+misconceptions, not obviously absurd.
+3. Cover DISTINCT concepts; never repeat a question.
+4. Include a brief explanation of why the correct answer is right (and, if useful, why a tempting option is wrong).
+5. If the material contains NO testable concept (only an anecdote, introduction, agenda or administrative \
+text), return an empty array [].
+6. Return ONLY JSON: an array (or an object wrapping the array) — no prose, no markdown, no code fences.
+
+MATERIAL:
 {text}
-
-Rules:
-1. Each question must have exactly 4 options labelled A, B, C, D.
-2. Exactly one option is correct.
-3. Include a brief explanation for the correct answer.
-4. Return ONLY a JSON array — no prose, no markdown, no code fences.
 
 JSON schema (array of objects):
 [
@@ -102,7 +126,9 @@ JSON schema (array of objects):
 
 # ── Parsing ────────────────────────────────────────────────────────────────────
 
-def _parse_response(raw: str) -> list[dict]:
+def _parse_response(raw: str, strict: bool = False) -> list[dict]:
+    """strict=True raises ValueError on unparsable output (so '[]' can mean 'nothing to ask')."""
+    bad = (lambda: (_ for _ in ()).throw(ValueError("Model output was not valid JSON"))) if strict else (lambda: [])
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE)
@@ -112,18 +138,18 @@ def _parse_response(raw: str) -> list[dict]:
     except json.JSONDecodeError:
         match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not match:
-            return []
+            return bad()
         try:
             parsed = json.loads(match.group())
         except json.JSONDecodeError:
-            return []
+            return bad()
     if isinstance(parsed, list):
         return parsed
     if isinstance(parsed, dict):
         for val in parsed.values():
             if isinstance(val, list):
                 return val
-    return []
+    return bad()
 
 
 def _validate(q: dict) -> bool:
@@ -154,25 +180,29 @@ async def _call_ollama(prompt: str, model: str) -> str:
 async def _call_openai_compat(
     prompt: str, model: str, base_url: str, api_key: str, timeout: float
 ) -> str:
-    """Handles Groq, Gemini, and any other OpenAI-compatible endpoint."""
+    """Handles Groq, Gemini, and any other OpenAI-compatible endpoint (retries on 429)."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        # JSON mode — supported by Groq and Gemini
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=timeout, verify=SSL_VERIFY) as client:
-        r = await client.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                # JSON mode — supported by Groq and Gemini
-                "response_format": {"type": "json_object"},
-            },
-        )
-        r.raise_for_status()
+        for attempt in range(3):
+            r = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            if r.status_code == 429 and attempt < 2:  # free-tier rate limit: wait, then retry
+                try:
+                    delay = float(r.headers.get("Retry-After", "")) 
+                except ValueError:
+                    delay = 10.0 * (attempt + 1)
+                await asyncio.sleep(min(delay, 30.0))
+                continue
+            r.raise_for_status()
+            break
     return r.json()["choices"][0]["message"]["content"]
 
 
@@ -199,9 +229,30 @@ async def generate_questions(
     model: str = DEFAULT_MODEL,
     provider: str = "ollama",
     api_key: str | None = None,
+    style: str = "mixed",
+    focus: str = "",
 ) -> list[dict]:
-    raw = await _call_llm(_USER_TEMPLATE.format(n=n, text=text), provider, model, api_key)
-    return [q for q in _parse_response(raw) if _validate(q)]
+    """[] means the model found nothing testable; raises ValueError on malformed output."""
+    focus = " ".join(focus.split())[:500]
+    focus_block = (
+        "\nLEARNER'S CONTEXT (from the person who uploaded this material):\n"
+        f"<<<{focus}>>>\n"
+        "Use it IN ADDITION to your own analysis of the material: still identify the key concepts the "
+        "material teaches, and also make sure concepts related to the learner's topics are covered and "
+        "given priority. Use the context to interpret terminology and decide what matters. Concepts in the "
+        "material that are not covered by the learner's topics are still fair game. Base every question on "
+        "the material itself (never invent facts it does not support).\n"
+        if focus else ""
+    )
+    prompt = _USER_TEMPLATE.format(
+        n=n, text=text, style=_STYLES.get(style, _STYLES["mixed"]), focus_block=focus_block
+    )
+    raw = await _call_llm(prompt, provider, model, api_key)
+    parsed = _parse_response(raw, strict=True)
+    valid = [q for q in parsed if _validate(q)]
+    if parsed and not valid:
+        raise ValueError("Model returned malformed questions")
+    return valid
 
 
 async def generate_questions_from_topic(

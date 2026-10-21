@@ -59,6 +59,11 @@ def create_exam(req: CreateExamRequest, db: Session = Depends(get_db), user: Use
         .filter(Question.label_id.in_(req.label_ids))
         .all()
     )
+    # The same question can be stored under several labels: keep one copy per text
+    unique: dict[str, Question] = {}
+    for item in pool:
+        unique.setdefault(" ".join(item.question_text.lower().split()), item)
+    pool = list(unique.values())
     if not pool:
         raise HTTPException(422, "No questions found for the selected label(s). Upload documents first.")
     if len(pool) < req.num_questions:

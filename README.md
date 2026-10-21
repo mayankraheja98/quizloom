@@ -20,7 +20,7 @@ Turn your own study material (PDF, Word, text notes, Notion pages) into a questi
 
 - **Sources:** PDF / DOCX / TXT upload, Notion page URL (sub-pages followed, optional image reading via Gemini vision), or generate from a topic.
 - **LLM providers:** local Ollama, Groq (free tier), Google Gemini (free tier). Keys are entered in the UI.
-- **Background generation** with live progress, per-chunk failure reporting and a clear done / partial / failed result.
+- **Background generation** with live progress, one automatic retry per chunk, request pacing and 429 backoff for free-tier limits, and a clear done / partial / failed result.
 - **Exams:** pick labels, number of questions and a countdown timer; one question at a time; score and full review with explanations.
 - **Accounts:** username/password (scrypt + JWT); every user's labels, questions and exams are isolated.
 - **Guard rails:** per-IP / per-user rate limits, upload size cap, SSRF-guarded image fetching, read-only demo account.
@@ -47,7 +47,7 @@ flowchart LR
     LLM --> GM[Gemini<br/>text + vision]
 ```
 
-**Generation flow:** source → parse into paragraph-sized chunks (150–2500 chars) → for each chunk ask the LLM for 1–3 MCQs as JSON → validate → store under the user's label. Progress and errors are tracked per job and polled by the UI.
+**Generation flow:** source → pack text into ~1,800-char windows with a small overlap (short text is merged, not dropped) → for each window ask the LLM for MCQs as JSON (count set by the *question density* option) → validate → store under the user's label. Progress and errors are tracked per job and polled by the UI.
 
 ```
 quizloom/
@@ -86,7 +86,7 @@ Optional local LLM: install [Ollama](https://ollama.com) and `ollama pull gemma3
 | `ALLOWED_ORIGINS` | `http://localhost:5173` | CORS (comma-separated) when frontend is on another origin |
 | `DISABLE_OLLAMA` | off | Hide Ollama (cloud deployments) |
 | `DEMO_ENABLED` | `true` | Seed the read-only `demo` account and show the demo button |
-| `MAX_UPLOAD_MB` | `10` | Upload size cap |
+| `MAX_UPLOAD_MB` | `25` | Upload size cap (use the PDF page range for books) |
 | `RATE_LIMIT_ENABLED` | `true` | Signup 5/h/IP, login 10/5min/IP, generation 30/h/user |
 | `NOTION_MAX_PAGES` | `50` | Cap on Notion pages followed per import |
 | `SSL_VERIFY` | `true` | Set `false` only behind a TLS-intercepting corporate proxy (local dev) |

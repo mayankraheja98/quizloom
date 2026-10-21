@@ -2,17 +2,20 @@
 Paragraph-level text extraction from PDF and DOCX files.
 
 Strategy:
-  - PDF: extract per-page text, split on blank lines, merge fragments
-    shorter than MIN_CHARS into adjacent paragraphs, cap at MAX_CHARS.
-  - DOCX: group non-empty paragraph runs separated by blank paragraphs.
+  - Extract paragraph-like units (PDF: split page text on blank lines; DOCX: each paragraph;
+    TXT: blank-line separated), then pack consecutive units into ~TARGET_CHARS windows
+    with a small sentence overlap. Short text is merged into neighbours, never dropped.
 """
 
 import re
 import pdfplumber
 from pathlib import Path
 
-MIN_CHARS = 150   # discard very short fragments
-MAX_CHARS = 2500  # cap chunk size sent to LLM
+MIN_CHARS = 60        # drop only pure noise (page numbers, stray headers)
+TARGET_CHARS = 1800   # aim for windows about this size
+MAX_CHARS = 2500      # soft cap on window size sent to the LLM
+OVERLAP_CHARS = 250   # trailing context repeated at the start of the next window
+_SENT = re.compile(r"(?<=[.!?])\s+")
 
 
 def _split_long(text: str) -> list[str]:
@@ -31,31 +34,70 @@ def _split_long(text: str) -> list[str]:
     return [p[:MAX_CHARS] for p in parts]
 
 
+def _tail(text: str) -> str:
+    """Last sentence(s) of `text`, up to OVERLAP_CHARS, used as context for the next window."""
+    out = ""
+    for sent in reversed(_SENT.split(text)):
+        if len(out) + len(sent) + 1 > OVERLAP_CHARS:
+            break
+        out = f"{sent} {out}".strip()
+    return out
+
+
 def _merge_and_filter(raw: list[str]) -> list[str]:
-    """Merge short fragments into neighbours; drop tiny leftovers."""
-    merged: list[str] = []
-    buf = ""
+    """Pack paragraph units into ~TARGET_CHARS windows with overlap; merge short leftovers."""
+    units: list[str] = []
     for p in raw:
         p = p.strip()
-        if not p:
-            continue
-        if buf:
-            buf += " " + p
-        else:
-            buf = p
-        if len(buf) >= MIN_CHARS:
-            merged.extend(_split_long(buf))
-            buf = ""
-    if buf and len(buf) >= MIN_CHARS:
-        merged.extend(_split_long(buf))
-    return merged
+        if p:
+            units.extend(_split_long(p))
+
+    windows: list[str] = []
+    seed = ""            # overlap carried over from the previous window
+    new_parts: list[str] = []   # units added since the last emit
+
+    def current() -> str:
+        return " ".join(([seed] if seed else []) + new_parts).strip()
+
+    for u in units:
+        if new_parts and len(current()) + 1 + len(u) > MAX_CHARS:
+            win = current()
+            windows.append(win)
+            seed, new_parts = _tail(win), []
+        new_parts.append(u)
+        if len(current()) >= TARGET_CHARS:
+            win = current()
+            windows.append(win)
+            seed, new_parts = _tail(win), []
+
+    if new_parts:
+        new = " ".join(new_parts)
+        if windows and len(new) < 400 and len(windows[-1]) + 1 + len(new) <= MAX_CHARS:
+            windows[-1] += " " + new            # short tail: merge into previous window
+        elif len(current()) >= MIN_CHARS:
+            windows.append(current())
+    return windows
 
 
-def extract_paragraphs_from_pdf(file_path: str) -> list[str]:
+def extract_paragraphs_from_pdf(
+    file_path: str, page_from: int | None = None, page_to: int | None = None
+) -> list[str]:
+    """Extract paragraphs; optional 1-based inclusive page range. Pages are released one by one."""
     raw: list[str] = []
     with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(x_tolerance=3, y_tolerance=3)
+        n = len(pdf.pages)
+        start = (page_from or 1) - 1
+        end = min(page_to or n, n)
+        if start >= n:
+            raise ValueError(f"PDF has only {n} page(s); page range starts at {page_from}.")
+        if end <= start:
+            raise ValueError("Invalid page range: 'To page' must be >= 'From page'.")
+        for i in range(start, end):
+            page = pdf.pages[i]
+            try:
+                text = page.extract_text(x_tolerance=3, y_tolerance=3)
+            finally:
+                page.flush_cache()  # keep memory flat on big books
             if not text:
                 continue
             # split on one or more blank lines
@@ -98,11 +140,13 @@ def extract_paragraphs_from_txt(file_path: str) -> list[str]:
     return _merge_and_filter(raw)
 
 
-def extract_paragraphs(file_path: str) -> list[str]:
-    """Dispatch based on file extension."""
+def extract_paragraphs(
+    file_path: str, page_from: int | None = None, page_to: int | None = None
+) -> list[str]:
+    """Dispatch based on file extension (page range applies to PDFs only)."""
     ext = Path(file_path).suffix.lower()
     if ext == ".pdf":
-        return extract_paragraphs_from_pdf(file_path)
+        return extract_paragraphs_from_pdf(file_path, page_from, page_to)
     elif ext in (".docx", ".doc"):
         return extract_paragraphs_from_docx(file_path)
     elif ext == ".txt":

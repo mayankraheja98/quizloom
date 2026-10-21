@@ -8,6 +8,7 @@ Both generation endpoints accept a `provider` field: ollama | groq | gemini.
 Cloud providers (groq, gemini) require an `api_key`.
 """
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -32,8 +33,29 @@ from services.ollama_client import (
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 SUPPORTED = {".pdf", ".docx", ".txt"}
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+MAX_LABELS = 5
+
+
+def _parse_labels(raw: str) -> list[str]:
+    """'A, B , A' -> ['A', 'B'] (comma-separated, de-duplicated, order kept)."""
+    seen: dict[str, None] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            seen.setdefault(part, None)
+    return list(seen)
+
+
+def _validate_labels(raw: str) -> None:
+    names = _parse_labels(raw)
+    if not names:
+        raise HTTPException(400, "Enter at least one label.")
+    if len(names) > MAX_LABELS:
+        raise HTTPException(400, f"At most {MAX_LABELS} labels per import.")
 
 
 def _get_or_create_label(db: Session, user_id: int, name: str) -> Label:
@@ -52,6 +74,16 @@ log = logging.getLogger("upload")
 
 # In-memory progress per (user_id, label) — resets on restart, fine for polling UX
 JOBS: dict[tuple[int, str], dict] = {}
+
+# Pause between chunks to stay under free-tier requests-per-minute limits
+CHUNK_DELAY_S = {"ollama": 0.0, "groq": 2.5, "gemini": 4.0}
+if os.getenv("LLM_CHUNK_DELAY"):
+    CHUNK_DELAY_S = {k: (v and float(os.environ["LLM_CHUNK_DELAY"])) for k, v in CHUNK_DELAY_S.items()}
+
+
+def _questions_for(chunk: str, density: float) -> int:
+    """`density` = questions per 1,000 characters; clamped to 1..6 per chunk."""
+    return max(1, min(6, round(len(chunk) / 1000 * density)))
 
 
 def _register_job(user_id: int, label_name: str):
@@ -73,47 +105,63 @@ async def _run_job(
     api_key: str | None,
     max_questions: int | None = None,
     extra: dict | None = None,
+    density: float = 2.0,
+    style: str = "mixed",
+    focus: str = "",
 ):
     """Generate questions chunk by chunk with its own DB session; record progress/errors."""
     job = JOBS[(user_id, label_name)] = {
         "total_chunks": len(paragraphs), "done_chunks": 0,
-        "failed_chunks": 0, "last_error": None, "finished": False,
-        "max_questions": max_questions,
+        "failed_chunks": 0, "retried_chunks": 0, "skipped_chunks": 0, "generated": 0, "last_error": None, "finished": False,
+        "max_questions": max_questions, "density": density,
         "phase": "generating",
         **(extra or {}),
     }
     generated = 0
     db = SessionLocal()
     try:
-        label = _get_or_create_label(db, user_id, label_name)
-        for para in paragraphs:
-            n = min(3, max(1, len(para) // 500))
+        labels = [_get_or_create_label(db, user_id, n) for n in _parse_labels(label_name)]
+        for idx, para in enumerate(paragraphs):
+            n = _questions_for(para, density)
             if max_questions is not None:
                 if generated >= max_questions:
                     break
                 n = min(n, max_questions - generated)
             try:
-                questions = await generate_questions(
-                    para, n=n, model=model, provider=provider, api_key=api_key
-                )
-                if not questions:
-                    raise ValueError("Model returned no valid questions for this chunk")
+                questions = None
+                for attempt in range(2):  # one retry on error, bad JSON or empty output
+                    try:
+                        questions = await generate_questions(
+                            para, n=n, model=model, provider=provider, api_key=api_key, style=style, focus=focus
+                        )
+                        break
+                    except Exception:
+                        if attempt == 1:
+                            raise
+                        job["retried_chunks"] += 1
+                        await asyncio.sleep(3)
+                if not questions:   # model judged the chunk has nothing testable (not a failure)
+                    job["skipped_chunks"] += 1
                 for q in questions:
-                    db.add(Question(
-                        label_id=label.id,
-                        question_text=q["question"],
-                        options=q["options"],
-                        answer=q["answer"],
-                        explanation=q.get("explanation", ""),
-                        source_file=source,
-                    ))
+                    for label in labels:   # a copy of each question under every label
+                        db.add(Question(
+                            label_id=label.id,
+                            question_text=q["question"],
+                            options=q["options"],
+                            answer=q["answer"],
+                            explanation=q.get("explanation", ""),
+                            source_file=source,
+                        ))
                 generated += len(questions)
+                job["generated"] = generated
                 db.commit()
             except Exception as e:
                 db.rollback()
                 job["failed_chunks"] += 1
                 job["last_error"] = f"{type(e).__name__}: {e}"[:300]
                 log.warning("chunk failed (%s): %s", label_name, job["last_error"])
+            if idx < len(paragraphs) - 1:
+                await asyncio.sleep(CHUNK_DELAY_S.get(provider, 0.0))
             job["done_chunks"] += 1
     except Exception as e:
         job["last_error"] = f"{type(e).__name__}: {e}"[:300]
@@ -123,9 +171,10 @@ async def _run_job(
         db.close()
 
 
-async def _ingest(file_path, filename, label_name, user_id, provider, model, api_key, max_questions=None):
+async def _ingest(file_path, filename, label_name, user_id, provider, model, api_key,
+                  max_questions=None, page_from=None, page_to=None, density=2.0, style="mixed", focus=""):
     try:
-        paragraphs = extract_paragraphs(file_path)
+        paragraphs = extract_paragraphs(file_path, page_from, page_to)
     except Exception as e:  # unreadable/corrupt file: report instead of polling forever
         log.exception("file parse failed")
         JOBS[(user_id, label_name)] = {
@@ -139,12 +188,13 @@ async def _ingest(file_path, filename, label_name, user_id, provider, model, api
             os.unlink(file_path)
         except OSError:
             pass
-    await _run_job(user_id, label_name, filename, paragraphs, provider, model, api_key, max_questions)
+    await _run_job(user_id, label_name, filename, paragraphs, provider, model, api_key,
+                   max_questions, density=density, style=style, focus=focus)
 
 
 async def _notion_job(
     user_id, label_name, page_id, notion_key, source,
-    provider, model, api_key, max_questions, read_images,
+    provider, model, api_key, max_questions, read_images, density=2.0, style="mixed", focus="",
 ):
     """Fetch the Notion block tree (page-capped), optionally read images, then generate."""
     key = (user_id, label_name)
@@ -182,10 +232,16 @@ async def _notion_job(
         log.exception("notion fetch failed")
         job.update(finished=True, total_chunks=0, last_error=f"{type(e).__name__}: {e}"[:600])
         return
-    await _run_job(user_id, label_name, source, paragraphs, provider, model, api_key, max_questions, stats)
+    await _run_job(user_id, label_name, source, paragraphs, provider, model, api_key,
+                   max_questions, stats, density, style, focus)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@router.get("/limits")
+def limits():
+    return {"max_upload_mb": MAX_UPLOAD_MB}
+
 
 @router.get("/providers")
 def list_providers():
@@ -225,12 +281,21 @@ async def upload_file(
     model: str = Form(default="llama3"),
     api_key: str = Form(default=""),
     max_questions: int | None = Form(default=None, ge=1, le=500),
+    page_from: int | None = Form(default=None, ge=1),
+    page_to: int | None = Form(default=None, ge=1),
+    density: float = Form(default=2.0, ge=0.5, le=6.0),
+    style: str = Form(default="mixed", pattern="^(conceptual|scenario|mixed)$"),
+    focus: str = Form(default="", max_length=500),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in SUPPORTED:
         raise HTTPException(400, f"Unsupported file type '{ext}'. Use PDF, DOCX or TXT.")
+
+    _validate_labels(label)
+    if page_from and page_to and page_to < page_from:
+        raise HTTPException(400, "'To page' must be greater than or equal to 'From page'.")
 
     key = api_key.strip() or None
     err = await probe_provider(provider, model, key)
@@ -245,14 +310,14 @@ async def upload_file(
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, f"File too large. Maximum size is {MAX_UPLOAD_MB} MB.")
+                    raise HTTPException(413, f"File too large (max {MAX_UPLOAD_MB} MB). Compress or split the file, or for a PDF book upload one chapter at a time using the page range.")
                 tmp.write(chunk)
     except HTTPException:
         os.unlink(tmp_path)
         raise
 
     _register_job(user.id, label)
-    background_tasks.add_task(_ingest, tmp_path, file.filename, label, user.id, provider, model, key, max_questions)
+    background_tasks.add_task(_ingest, tmp_path, file.filename, label, user.id, provider, model, key, max_questions, page_from, page_to, density, style, focus)
 
     return {
         "message": "File accepted. Question generation running in background.",
@@ -275,6 +340,7 @@ class TopicRequest(BaseModel):
 async def generate_from_topic(
     req: TopicRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
+    _validate_labels(req.label)
     if req.num_questions < 1 or req.num_questions > 100:
         raise HTTPException(400, "num_questions must be between 1 and 100")
 
@@ -296,17 +362,18 @@ async def generate_from_topic(
     if not questions:
         raise HTTPException(502, "Model returned no valid questions. Try a different topic or model.")
 
-    label = _get_or_create_label(db, user.id, req.label)
+    labels = [_get_or_create_label(db, user.id, n) for n in _parse_labels(req.label)]
 
     for q in questions:
-        db.add(Question(
-            label_id=label.id,
-            question_text=q["question"],
-            options=q["options"],
-            answer=q["answer"],
-            explanation=q.get("explanation", ""),
-            source_file=f"[{req.provider}] {req.topic}",
-        ))
+        for label in labels:   # a copy of each question under every label
+            db.add(Question(
+                label_id=label.id,
+                question_text=q["question"],
+                options=q["options"],
+                answer=q["answer"],
+                explanation=q.get("explanation", ""),
+                source_file=f"[{req.provider}] {req.topic}",
+            ))
     db.commit()
 
     return {
@@ -326,6 +393,9 @@ class NotionRequest(BaseModel):
     model: str = "llama3"
     api_key: str = ""     # LLM provider API key (for groq/gemini)
     max_questions: int | None = Field(default=None, ge=1, le=500)  # None = auto
+    density: float = Field(default=2.0, ge=0.5, le=6.0)  # questions per 1,000 characters
+    style: str = Field(default="mixed", pattern="^(conceptual|scenario|mixed)$")
+    focus: str = Field(default="", max_length=500)  # optional: what the material is about / what to test
     read_images: bool = False  # transcribe images with Gemini vision (provider must be gemini)
 
 
@@ -342,6 +412,7 @@ async def ingest_from_notion(
     if err:
         raise HTTPException(503, err)
 
+    _validate_labels(req.label)
     if req.read_images and req.provider != "gemini":
         raise HTTPException(400, "Reading images requires the Gemini provider.")
 
@@ -357,7 +428,7 @@ async def ingest_from_notion(
     background_tasks.add_task(
         _notion_job, user.id, req.label, page_id, req.notion_api_key.strip(),
         f"[notion] {page_title}", req.provider, req.model, llm_key,
-        req.max_questions, req.read_images,
+        req.max_questions, req.read_images, req.density, req.style, req.focus,
     )
     return {
         "message": f"Notion page '{page_title}' accepted. Fetching and generating in background.",
@@ -368,6 +439,7 @@ async def ingest_from_notion(
 
 @router.get("/status/{label_name}")
 def label_status(label_name: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    label = db.query(Label).filter(Label.user_id == user.id, Label.name == label_name).first()
+    names = _parse_labels(label_name)   # may be "A, B": copies are identical, so count the first
+    label = db.query(Label).filter(Label.user_id == user.id, Label.name == names[0]).first() if names else None
     count = db.query(Question).filter(Question.label_id == label.id).count() if label else 0
     return {"label": label_name, "question_count": count, "job": JOBS.get((user.id, label_name))}
